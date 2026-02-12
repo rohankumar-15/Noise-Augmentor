@@ -7,13 +7,10 @@ speech intelligibility. Designed for creating training data for speech processin
 """
 
 import argparse
-import gc
 import logging
 import os
 import random
 import sys
-import tempfile
-import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -34,25 +31,12 @@ INTERMITTENT_CHUNK_MIN = 2.0  # seconds
 INTERMITTENT_CHUNK_MAX = 8.0  # seconds
 FADE_DURATION_MIN = 0.2  # seconds
 FADE_DURATION_MAX = 0.5  # seconds
-MIN_DYNAMIC_RANGE_DB = 10.0
 MIN_SPEECH_ADVANTAGE_DB = 3.0
-CHUNK_DURATION = 300  # 5 minutes in seconds for chunked processing
 
 
 class NoiseType(Enum):
     CONTINUOUS = "continuous"
     INTERMITTENT = "intermittent"
-    MIXED = "mixed"
-
-
-@dataclass
-class AudioFile:
-    """Represents an audio file with metadata."""
-    path: Path
-    duration: float = 0.0
-    sample_rate: int = 0
-    is_valid: bool = False
-    error_message: str = ""
 
 
 @dataclass
@@ -109,48 +93,6 @@ def calculate_rms_db(audio: np.ndarray) -> float:
     """Calculate RMS value in decibels."""
     rms = calculate_rms(audio)
     return linear_to_db(rms)
-
-
-def validate_file_path(path: Union[str, Path]) -> Tuple[bool, Path, str]:
-    """
-    Validate that a file path exists and is readable.
-    
-    Returns:
-        Tuple of (is_valid, resolved_path, error_message)
-    """
-    try:
-        path = Path(path).resolve()
-        if not path.exists():
-            return False, path, f"File does not exist: {path}"
-        if not path.is_file():
-            return False, path, f"Path is not a file: {path}"
-        if not os.access(path, os.R_OK):
-            return False, path, f"File is not readable: {path}"
-        if path.suffix.lower() not in SUPPORTED_FORMATS:
-            return False, path, f"Unsupported format '{path.suffix}'. Supported: {SUPPORTED_FORMATS}"
-        return True, path, ""
-    except Exception as e:
-        return False, Path(path), f"Error validating path: {str(e)}"
-
-
-def validate_directory(path: Union[str, Path]) -> Tuple[bool, Path, str]:
-    """
-    Validate that a directory path exists and is readable.
-    
-    Returns:
-        Tuple of (is_valid, resolved_path, error_message)
-    """
-    try:
-        path = Path(path).resolve()
-        if not path.exists():
-            return False, path, f"Directory does not exist: {path}"
-        if not path.is_dir():
-            return False, path, f"Path is not a directory: {path}"
-        if not os.access(path, os.R_OK):
-            return False, path, f"Directory is not readable: {path}"
-        return True, path, ""
-    except Exception as e:
-        return False, Path(path), f"Error validating directory: {str(e)}"
 
 
 def get_audio_files(path: Union[str, Path], logger: logging.Logger) -> List[Path]:
@@ -221,13 +163,6 @@ def validate_audio_quality(audio: np.ndarray, is_noise: bool = False) -> Tuple[b
     if clip_ratio > 0.01:
         return False, f"Audio is severely clipped ({clip_ratio*100:.1f}% of samples)"
     
-    if not is_noise:
-        # Check dynamic range for clean audio
-        peak_db = linear_to_db(np.max(np.abs(audio)))
-        dynamic_range = peak_db - rms_db
-        if dynamic_range < MIN_DYNAMIC_RANGE_DB:
-            return True, f"Warning: Low dynamic range ({dynamic_range:.1f} dB). Audio may already be degraded."
-    
     return True, ""
 
 
@@ -247,11 +182,8 @@ def remove_silence(
     Returns:
         Trimmed audio array
     """
-    threshold = db_to_linear(threshold_db)
-    
     # Use librosa's trim function
     trimmed, _ = librosa.effects.trim(audio, top_db=abs(threshold_db))
-    
     return trimmed
 
 
@@ -336,30 +268,17 @@ def create_fade_envelope(length: int, fade_in: int, fade_out: int) -> np.ndarray
     return envelope
 
 
-def apply_soft_limiting(audio: np.ndarray, threshold: float = 0.95) -> np.ndarray:
+def apply_hard_limiting(audio: np.ndarray) -> np.ndarray:
     """
-    Apply soft limiting to prevent clipping.
-    
-    Uses tanh-based soft clipping for natural sound.
+    Apply simple hard limiting to prevent clipping.
     
     Args:
         audio: Audio signal array
-        threshold: Threshold above which limiting kicks in
     
     Returns:
         Limited audio array
     """
-    # Check if limiting is needed
-    peak = np.max(np.abs(audio))
-    if peak <= 1.0:
-        return audio
-    
-    # Apply tanh-based soft limiting
-    # Scale so that threshold maps to desired output
-    scale = threshold / peak
-    limited = np.tanh(audio * scale * 1.5) / np.tanh(1.5)
-    
-    return limited
+    return np.clip(audio, -1.0, 1.0)
 
 
 def calculate_snr_scale(clean_rms: float, noise_rms: float, target_snr_db: float) -> float:
@@ -522,11 +441,8 @@ def mix_audio(
     # Mix
     mixed = clean + scaled_noise
     
-    # Apply soft limiting if needed
-    if np.max(np.abs(mixed)) > 1.0:
-        mixed = apply_soft_limiting(mixed)
-        if logger:
-            logger.debug("Applied soft limiting to prevent clipping")
+    # Apply hard limiting to prevent clipping
+    mixed = apply_hard_limiting(mixed)
     
     # Calculate actual SNR achieved
     actual_noise_rms = calculate_rms(scaled_noise)
@@ -711,11 +627,8 @@ def process_single_file(
     is_valid, message = validate_audio_quality(clean, is_noise=False)
     if not is_valid:
         return False, message, 0.0
-    if message and logger:
-        logger.warning(f"{clean_path.name}: {message}")
     
     clean_length = len(clean)
-    clean_duration = clean_length / sr
     
     # Select random noise file
     noise_path, noise = random.choice(noise_files)
@@ -729,27 +642,9 @@ def process_single_file(
     # Prepare noise based on type
     if noise_type == NoiseType.CONTINUOUS:
         prepared_noise = prepare_noise_continuous(noise, clean_length, sr)
-    elif noise_type == NoiseType.INTERMITTENT:
+    else:  # INTERMITTENT
         segments = segment_noise(noise, sr)
         prepared_noise = prepare_noise_intermittent(segments, clean_length, sr)
-    else:  # MIXED
-        # Apply both continuous (at lower level) and intermittent
-        continuous = prepare_noise_continuous(noise, clean_length, sr) * 0.5
-        
-        # Use different noise for intermittent if available
-        if len(noise_files) > 1:
-            other_noise_path, other_noise = random.choice(
-                [(p, n) for p, n in noise_files if p != noise_path]
-            )
-            segments = segment_noise(other_noise, sr)
-        else:
-            segments = segment_noise(noise, sr)
-        
-        intermittent = prepare_noise_intermittent(segments, clean_length, sr)
-        prepared_noise = continuous + intermittent
-        
-        # Re-normalize combined noise
-        prepared_noise = normalize_rms(prepared_noise, RMS_TARGET_DB)
     
     # Mix audio
     mixed, actual_snr = mix_audio(clean, prepared_noise, target_snr, logger)
@@ -778,126 +673,7 @@ def process_single_file(
     if not success:
         return False, error, 0.0
     
-    # Clean up
-    del clean, prepared_noise, mixed
-    gc.collect()
-    
     return True, str(output_path), actual_snr
-
-
-def process_chunked(
-    clean_path: Path,
-    noise_files: List[Tuple[Path, np.ndarray]],
-    output_dir: Path,
-    noise_type: NoiseType,
-    snr_min: float,
-    snr_max: float,
-    sr: int = TARGET_SAMPLE_RATE,
-    chunk_duration: float = CHUNK_DURATION,
-    logger: Optional[logging.Logger] = None
-) -> Tuple[bool, str, float]:
-    """
-    Process a long audio file in chunks to manage memory.
-    
-    Args:
-        clean_path: Path to clean audio file
-        noise_files: List of (path, preprocessed_noise) tuples
-        output_dir: Output directory
-        noise_type: Type of noise application
-        snr_min: Minimum SNR in dB
-        snr_max: Maximum SNR in dB
-        sr: Sample rate
-        chunk_duration: Duration of each chunk in seconds
-        logger: Optional logger
-    
-    Returns:
-        Tuple of (success, message, snr_used)
-    """
-    if logger:
-        logger.debug(f"Processing in chunks: {clean_path.name}")
-    
-    # Get total duration first
-    try:
-        total_duration = librosa.get_duration(path=str(clean_path))
-    except Exception as e:
-        return False, f"Could not get duration: {str(e)}", 0.0
-    
-    if total_duration <= chunk_duration:
-        # Not actually long, process normally
-        return process_single_file(
-            clean_path, noise_files, output_dir, noise_type,
-            snr_min, snr_max, sr, logger
-        )
-    
-    # Select consistent parameters for all chunks
-    noise_path, noise = random.choice(noise_files)
-    target_snr = random.uniform(snr_min, snr_max)
-    
-    if logger:
-        logger.debug(f"Long file ({total_duration:.1f}s), processing in {chunk_duration}s chunks")
-    
-    # Process in chunks and concatenate
-    output_chunks = []
-    chunk_samples = int(chunk_duration * sr)
-    offset = 0
-    
-    while offset < total_duration:
-        # Load chunk
-        try:
-            chunk, _ = librosa.load(
-                str(clean_path),
-                sr=sr,
-                mono=True,
-                offset=offset,
-                duration=chunk_duration
-            )
-        except Exception as e:
-            return False, f"Failed to load chunk at {offset}s: {str(e)}", 0.0
-        
-        chunk_length = len(chunk)
-        
-        # Prepare noise for this chunk
-        if noise_type == NoiseType.CONTINUOUS:
-            prepared_noise = prepare_noise_continuous(noise, chunk_length, sr)
-        elif noise_type == NoiseType.INTERMITTENT:
-            segments = segment_noise(noise, sr)
-            prepared_noise = prepare_noise_intermittent(segments, chunk_length, sr)
-        else:
-            continuous = prepare_noise_continuous(noise, chunk_length, sr) * 0.5
-            segments = segment_noise(noise, sr)
-            intermittent = prepare_noise_intermittent(segments, chunk_length, sr)
-            prepared_noise = continuous + intermittent
-            prepared_noise = normalize_rms(prepared_noise, RMS_TARGET_DB)
-        
-        # Mix
-        mixed_chunk, _ = mix_audio(chunk, prepared_noise, target_snr, logger)
-        output_chunks.append(mixed_chunk)
-        
-        offset += chunk_duration
-        
-        # Clean up
-        del chunk, prepared_noise, mixed_chunk
-        gc.collect()
-    
-    # Concatenate all chunks
-    full_output = np.concatenate(output_chunks)
-    
-    # Generate output filename
-    noise_type_str = noise_type.value
-    output_filename = f"{clean_path.stem}_aug_{noise_type_str}.wav"
-    output_path = output_dir / output_filename
-    
-    # Save output
-    success, error = save_audio(full_output, output_path, sr, logger)
-    
-    # Clean up
-    del output_chunks, full_output
-    gc.collect()
-    
-    if not success:
-        return False, error, 0.0
-    
-    return True, str(output_path), target_snr
 
 
 def run_augmentation(
@@ -907,9 +683,7 @@ def run_augmentation(
     noise_type: str = "continuous",
     snr_min: float = 5.0,
     snr_max: float = 15.0,
-    dry_run: bool = False,
-    verbose: bool = False,
-    seed: Optional[int] = None
+    verbose: bool = False
 ) -> ProcessingStats:
     """
     Main function to run audio augmentation.
@@ -921,9 +695,7 @@ def run_augmentation(
         noise_type: Type of noise application
         snr_min: Minimum SNR in dB
         snr_max: Maximum SNR in dB
-        dry_run: If True, validate without processing
         verbose: Enable verbose logging
-        seed: Random seed for reproducibility
     
     Returns:
         ProcessingStats object with results
@@ -931,17 +703,11 @@ def run_augmentation(
     logger = setup_logging(verbose)
     stats = ProcessingStats()
     
-    # Set random seed
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-        logger.info(f"Random seed set to: {seed}")
-    
     # Parse noise type
     try:
         noise_type_enum = NoiseType(noise_type.lower())
     except ValueError:
-        logger.error(f"Invalid noise type: {noise_type}. Valid: continuous, intermittent, mixed")
+        logger.error(f"Invalid noise type: {noise_type}. Valid: continuous, intermittent")
         return stats
     
     # Validate SNR range
@@ -984,25 +750,12 @@ def run_augmentation(
     elif clean_input.is_dir():
         output_path = clean_input / "augmented"
     else:
-        output_path = clean_input.parent
+        output_path = clean_input.parent / "augmented"
     
     logger.info(f"Output directory: {output_path}")
     
-    # Pre-flight validation of all files
-    logger.info("Validating input files...")
-    
-    valid_clean_files = []
-    for path in clean_files:
-        is_valid, resolved, error = validate_file_path(path)
-        if is_valid:
-            valid_clean_files.append(resolved)
-        else:
-            logger.warning(f"Skipping invalid clean file: {error}")
-            stats.files_failed += 1
-    
-    if not valid_clean_files:
-        logger.error("No valid clean audio files to process")
-        return stats
+    # Create output directory
+    output_path.mkdir(parents=True, exist_ok=True)
     
     # Preprocess noise files
     logger.info("Preprocessing noise files...")
@@ -1021,43 +774,17 @@ def run_augmentation(
     
     logger.info(f"Successfully preprocessed {len(noise_files)} noise file(s)")
     
-    # Dry run mode
-    if dry_run:
-        logger.info("\n=== DRY RUN MODE ===")
-        logger.info(f"Would process {len(valid_clean_files)} clean file(s)")
-        logger.info(f"Using {len(noise_files)} noise file(s)")
-        logger.info(f"Noise type: {noise_type_enum.value}")
-        logger.info(f"SNR range: {snr_min:.1f} to {snr_max:.1f} dB")
-        logger.info(f"Output directory: {output_path}")
-        
-        for i, f in enumerate(valid_clean_files[:10], 1):
-            logger.info(f"  {i}. {f.name}")
-        if len(valid_clean_files) > 10:
-            logger.info(f"  ... and {len(valid_clean_files) - 10} more")
-        
-        return stats
-    
-    # Create output directory
-    output_path.mkdir(parents=True, exist_ok=True)
-    
     # Process files
-    logger.info(f"Processing {len(valid_clean_files)} file(s)...")
+    logger.info(f"Processing {len(clean_files)} file(s)...")
     
-    for clean_path in tqdm(valid_clean_files, desc="Augmenting"):
+    for clean_path in tqdm(clean_files, desc="Augmenting"):
         try:
-            # Check if file is long (>5 minutes)
             duration = librosa.get_duration(path=str(clean_path))
             
-            if duration > CHUNK_DURATION:
-                success, message, snr = process_chunked(
-                    clean_path, noise_files, output_path, noise_type_enum,
-                    snr_min, snr_max, TARGET_SAMPLE_RATE, CHUNK_DURATION, logger
-                )
-            else:
-                success, message, snr = process_single_file(
-                    clean_path, noise_files, output_path, noise_type_enum,
-                    snr_min, snr_max, TARGET_SAMPLE_RATE, logger
-                )
+            success, message, snr = process_single_file(
+                clean_path, noise_files, output_path, noise_type_enum,
+                snr_min, snr_max, TARGET_SAMPLE_RATE, logger
+            )
             
             if success:
                 stats.files_processed += 1
@@ -1074,13 +801,6 @@ def run_augmentation(
             stats.files_failed += 1
             stats.warnings.append(f"{clean_path.name}: {str(e)}")
             logger.error(f"Error processing {clean_path.name}: {str(e)}")
-        
-        # Garbage collection after each file
-        gc.collect()
-    
-    # Clean up noise arrays
-    del noise_files
-    gc.collect()
     
     # Print summary
     logger.info("\n" + "=" * 50)
@@ -1121,12 +841,6 @@ Examples:
 
   # Specify SNR range and noise type
   python augmentor.py -c audio.wav -n noise.wav --snr-min 8 --snr-max 12 --noise-type intermittent
-
-  # Dry run to preview
-  python augmentor.py -c ./audio/ -n ./noise/ --dry-run
-
-  # Verbose with reproducible results
-  python augmentor.py -c audio.wav -n noise.wav -v --seed 42
         """
     )
     
@@ -1145,11 +859,11 @@ Examples:
     # Optional arguments
     parser.add_argument(
         '-o', '--output',
-        help='Output directory (default: "augmented" subdirectory or same directory for single files)'
+        help='Output directory (default: "augmented" subdirectory)'
     )
     parser.add_argument(
         '--noise-type',
-        choices=['continuous', 'intermittent', 'mixed'],
+        choices=['continuous', 'intermittent'],
         default='continuous',
         help='Type of noise application (default: continuous)'
     )
@@ -1166,19 +880,9 @@ Examples:
         help='Maximum SNR in dB (default: 15.0)'
     )
     parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Validate inputs and show processing plan without actual processing'
-    )
-    parser.add_argument(
         '-v', '--verbose',
         action='store_true',
         help='Enable verbose logging with detailed processing information'
-    )
-    parser.add_argument(
-        '--seed',
-        type=int,
-        help='Random seed for reproducible results'
     )
     
     args = parser.parse_args()
@@ -1200,9 +904,7 @@ Examples:
         noise_type=args.noise_type,
         snr_min=args.snr_min,
         snr_max=args.snr_max,
-        dry_run=args.dry_run,
-        verbose=args.verbose,
-        seed=args.seed
+        verbose=args.verbose
     )
     
     # Exit with appropriate code
